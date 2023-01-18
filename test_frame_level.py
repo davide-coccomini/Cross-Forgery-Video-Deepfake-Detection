@@ -73,8 +73,10 @@ if __name__ == "__main__":
                         help="Which model architecture version to be trained (0: ViT, 1: EfficientNet B7, 2: Hybrid)")
     parser.add_argument('--forgery_method', type=int, default=1, 
                         help="Forgery method used for training")
-    parser.add_argument('--save_errors', type=bool, default=False, 
+    parser.add_argument('--save_errors', action="store_true", default=False, 
                         help="Save errors in directory?")
+    parser.add_argument('--ignore_fake_real', action="store_true", default=False, 
+                        help="Ignore real frames in fake videos.")
     opt = parser.parse_args()
     print(opt)
 
@@ -109,25 +111,53 @@ if __name__ == "__main__":
     elif opt.model == 3: 
         if opt.use_pretrained:
             print("Pretrained network not found for this model, working from scratch.")
-
-    model.load_state_dict(torch.load(opt.model_path))
+    
+    if opt.model_path != '':
+        model_path = opt.model_path
+        while not os.path.exists(model_path):
+            epoch = int(model_path.split("_")[-2])
+            model_name = model_path.split("_")[:-3]
+            model_method = model_path.split("_")[:-1]
+            model_path = model_name + "_" + str(epoch - 1) + "_" + model_method
+            print("Trying new model weights", model_path)
+            if epoch == 0:
+                print("No model found.")
+                exit()
+        model.load_state_dict(torch.load(model_path))
+        print("Weights loaded")
+    else:
+        print("No weights loaded.")
+        exit()
 
     model.eval()
     df = pd.read_csv(opt.list_file, sep=' ')
      
-    results_df = pd.DataFrame(columns=[i for i in range(14)], index=[0])
+    col_names = [i for i in range(9)]
+    col_names.extend(["real_accuracy", "fake_accuracy", "global_accuracy", "variance"])
+    results_df_accuracy = pd.DataFrame(columns=col_names, index=[0])
+
+    
+    col_names = [i for i in range(9)]
+    col_names.extend(["real_f1", "fake_f1", "global_f1", "variance"])
+    results_df_f1 = pd.DataFrame(columns=col_names, index=[0])
+
+
     fake_accuracy = 0
+    fake_f1 = 0
     real_accuracy = 0
+    real_f1 = 0
     values = []
 
     os.makedirs(os.path.join("results/frame_level",), exist_ok=True)
-    print("FORGERY METHOD", opt.forgery_method, "MODEL", opt.model_path)
+    print("FORGERY METHOD", opt.forgery_method, "MODEL", model_path)
     for forgery_method in range(0, 9):
         f = open(os.path.join("results/frame_level", opt.model_name + "_" + str(opt.forgery_method) + "_" + str(forgery_method) + "_labels.txt"), "w+")
         df_tmp = df.loc[(df["16cls_label"] == forgery_method)]
         if opt.max_videos > -1:
-            df = df.head(opt.max_videos)
+            df_tmp = df_tmp.head(opt.max_videos)
         df_tmp = df_tmp.sort_values(by=['image_name'])
+        if opt.ignore_fake_real and forgery_method != 0:
+            df_tmp = df.loc[df_tmp["binary_cls_label"] == 1]
         paths = df_tmp.to_numpy()
         paths = np.array_split(paths, opt.workers) # Split the paths in chunks for processing
         mgr = Manager()
@@ -179,24 +209,43 @@ if __name__ == "__main__":
 
     
         current_accuracy = accuracy_score(correct_labels, preds)
+        current_f1 = f1_score(correct_labels, preds, average='weighted')
+
         if forgery_method == 0:
             real_accuracy = current_accuracy
+            real_f1 = current_f1
         else:
             fake_accuracy += current_accuracy
+            fake_f1 += current_f1
 
-        string = "ACCURACY: " + str(current_accuracy)
+        string = "ACCURACY: " + str(current_accuracy) + "F1: " + str(current_f1)
         print("Method", forgery_method, string)
         f.write(string)
-        results_df[forgery_method] = round(current_accuracy, 3)
-        values.append(round(current_accuracy, 3))
+        results_df_accuracy[forgery_method] = round(current_accuracy, 3)
+        results_df_f1[forgery_method] = round(current_f1, 3)
+        values_accuracy.append(round(current_accuracy, 3))
+        values_f1.append(round(current_f1, 3))
 
-    fake_accuracy /= 9
+    fake_accuracy /= 8
+    fake_f1 /= 8
     global_accuracy = mean([fake_accuracy, real_accuracy])
 
-    results_df.insert(10, "real_accuracy", real_accuracy)
-    results_df.insert(11, "fake_accuracy", fake_accuracy)
-    results_df.insert(12, "global_accuracy", global_accuracy)
-    results_df.insert(13, "variance", np.var(values))
-    print(results_df)
+    results_df_accuracy["real_accuracy"] = round(real_accuracy, 3)
+    results_df_accuracy["fake_accuracy"] = round(fake_accuracy, 3)
+    results_df_accuracy["global_accuracy"] = round(global_accuracy, 3)
+    results_df_accuracy["variance"] = round(np.var(values_accuracy), 3)
+
+    
+    results_df_f1["real_f1"] = round(real_f1, 3)
+    results_df_f1["fake_f1"] = round(fake_f1, 3)
+    results_df_f1["global_f1"] = round(global_f1, 3)
+    results_df_f1["variance"] = round(np.var(values_f1), 3)
+
+    print(results_df_accuracy)
+    print(results_df_f1)
     f.close()
-    results_df.to_csv(os.path.join("results/frame_level", opt.model_name + "_" + str(opt.forgery_method) + "_metrics.csv"))
+    ignored = ""
+    if opt.ignore_fake_real:
+        ignored = "_ignoredrealfake"
+    results_df_accuracy.to_csv(os.path.join("results/frame_level", opt.model_name + "_" + str(opt.forgery_method) + "_accuracy" + ignored + ".csv"))
+    results_df_accuracy.to_csv(os.path.join("results/frame_level", opt.model_name + "_" + str(opt.forgery_method) + "_f1" + ignored + ".csv"))

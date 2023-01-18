@@ -17,10 +17,10 @@ from functools import partial
 from sklearn.utils import shuffle
 
 from sklearn.model_selection import train_test_split
+from pytorch_lightning import seed_everything
 
 import timm
 from timm.models.efficientnet import tf_efficientnet_b7_ns
-from mlp_mixer_pytorch import MLPMixer
 from timm.scheduler.cosine_lr import CosineLRScheduler
 
 
@@ -29,20 +29,20 @@ import collections
 from deepfakes_dataset import DeepFakesDataset
 #from torch.optim import lr_scheduler
 from progress.bar import ChargingBar
-from utils import check_correct, resize, get_n_params
+from utils import check_correct, resize, get_n_params, custom_round_single_value
 from transformers import ViTForImageClassification, ViTConfig
 
 from torch.utils.tensorboard import SummaryWriter
-
-
+from torch.utils.data import WeightedRandomSampler
+from sklearn.metrics import f1_score
 IMAGE_SIZE = 224
 
 def read_images(paths, dataset, opt):
     fail = 0
     for path in paths:
         #video_path_tmp = os.path.dirname(path[0]).split("release")[1]  
-        image_path = os.path.join(opt.data_path, path[0])
-        label = path[1]
+        image_path = os.path.join(opt.data_path, path[1])
+        label = path[2]
         if not os.path.exists(image_path):
             return
         image = cv2.imread(image_path)
@@ -54,12 +54,13 @@ def read_images(paths, dataset, opt):
 
 # Main body
 if __name__ == "__main__":
-    os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+    os.environ["CUDA_VISIBLE_DEVICES"] = "4"
+    seed_everything(42)
     random.seed(42)
     parser = argparse.ArgumentParser()
     parser.add_argument('--num_epochs', default=30, type=int,
                         help='Number of training epochs.')
-    parser.add_argument('--workers', default=10, type=int,
+    parser.add_argument('--workers', default=50, type=int,
                         help='Number of data loader workers.')
     parser.add_argument('--data_path', default='../../datasets/deepfakes', type=str,
                         help='Videos directory')
@@ -73,20 +74,14 @@ if __name__ == "__main__":
                         help='Path to save checkpoints.')
     parser.add_argument('--gpu_id', default=1, type=int,
                         help='ID of GPU to be used.')
-    parser.add_argument('--max_videos', type=int, default=-1, 
-                        help="Maximum number of videos to use for training (default: all).")
     parser.add_argument('--config', type=str, default='',
                         help="Which configuration to use. See into 'config' folder.")
     parser.add_argument('--model', type=int, default=0, 
                         help="Which model architecture version to be trained (0: ViT, 1: EfficientNet B7, 2: Hybrid)")
     parser.add_argument('--patience', type=int, default=5, 
                         help="How many epochs wait before stopping for validation loss not improving.")
-    parser.add_argument('--forgery_methods', type=list, default=[7,8], 
+    parser.add_argument('--forgery_methods', '--list', nargs='+', 
                         help="Which forgery method for training?")
-    parser.add_argument('--fake_multiplier', type=int, default=1, 
-                        help="Oversampling factor for fake faces")
-    parser.add_argument('--real_multiplier', type=int, default=0.05, 
-                        help="Oversampling factor for real faces")
     parser.add_argument('--use_pretrained', type=bool, default=True, 
                         help="Use pretrained models")
     parser.add_argument('--show_stats', type=bool, default=True, 
@@ -96,6 +91,8 @@ if __name__ == "__main__":
                         
     opt = parser.parse_args()
     print(opt)
+
+    opt.forgery_methods = [int(method) for method in opt.forgery_methods]
 
     # Model Loading
     if opt.config != '':
@@ -150,20 +147,47 @@ if __name__ == "__main__":
     for forgery_method in opt.forgery_methods:
         forgery_method = int(forgery_method)
         df1 = df.loc[(df["16cls_label"] == forgery_method)]
-        if opt.max_videos > -1:
-            df1 = df1.head(int(opt.max_videos))
         dataframes.append(df1)
 
     df2 = df.loc[(df["16cls_label"] == 0)]
-    if opt.max_videos > -1:
-        df2 = df2.head(int(opt.max_videos)*len(opt.forgery_methods))
-    dataframes.append(df2)
-    df = pd.concat(dataframes)
     #df = df.drop(df[(df['16cls_label'] == 0) & (df.index % 2 == 0)].index)
-    df = df.drop(['16cls_label'], axis=1)
 
+    dataframes.append(df2)
+
+    df = pd.concat(dataframes)
+    df = df.reset_index()
+    # For class 0, sample two frames per video
+    already_seen_videos = {}
+    indexes_to_drop = []
+    for index, row in df.iterrows():
+        path = row['image_name']
+        label = int(row['16cls_label'])
+        if label != 0:
+            continue
+        video_id = path.split(os.sep)[-1].split("_video")[0]
+        if video_id in already_seen_videos:
+            if already_seen_videos[video_id] < 3:
+                already_seen_videos[video_id] += 1
+                continue
+            else:
+                already_seen_videos[video_id] += 1
+        else:
+            already_seen_videos[video_id] = 1
+        
+        indexes_to_drop.append(index)
+    df.drop(df.index[indexes_to_drop], inplace=True)
+    if opt.show_stats:  
+        print("**** REDUCED DATASET STATS ****")
+        string = ""
+        for i in range(0, 9):
+            string += "Class " + str(i) + ": " + str(len(df.loc[df["16cls_label"] == i])) + " | "
+        print(string)
+    
+
+    df = df.drop(['16cls_label'], axis=1)
     df = df.sort_values(by=['image_name'])
     paths = df.to_numpy()
+    
     paths = np.array_split(paths, opt.workers) # Split the paths in chunks for processing
     mgr = Manager()
     dataset = mgr.list()
@@ -173,10 +197,12 @@ if __name__ == "__main__":
             for v in p.imap_unordered(partial(read_images, dataset=dataset, opt=opt), paths):
                 pbar.update()
     
-    dataset = sorted(dataset, key=lambda tup: tup[1])
+    #dataset = sorted(dataset, key=lambda tup: tup[1])
+    random.shuffle(dataset)
     print(len(dataset))
     labels = [float(row[1]) for row in dataset]
     dataset = [row[0] for row in dataset]
+    
     train_dataset, validation_dataset, train_labels, validation_labels = train_test_split(dataset, labels, test_size=0.10, random_state=42)
 
     train_samples = len(train_dataset)
@@ -188,7 +214,7 @@ if __name__ == "__main__":
     train_counters = collections.Counter(train_labels)
     print(train_counters)
     
-    class_weights = train_counters[0] / train_counters[1]
+    class_weights = train_counters[1] / train_counters[0]
     print("Weights", class_weights)
 
     print("__VALIDATION STATS__")
@@ -196,17 +222,26 @@ if __name__ == "__main__":
     print(val_counters)
     print("___________________")
 
-    loss_fn = torch.nn.BCEWithLogitsLoss(pos_weight=torch.tensor([class_weights]))
+    loss_fn = torch.nn.BCEWithLogitsLoss()
 
     # Create the data loaders
     if opt.config != '':
         batch_size = config['training']['bs']
     else:
         batch_size = 8
+    print(class_weights)
+    class_weights = [class_weights, 1-class_weights]
+    print(class_weights)
+    sample_weights = [0] * len(dataset)
+    
+    for index, sample in enumerate(train_dataset):
+        label = int(train_labels[index])
+        sample_weights[index] = class_weights[label]
 
+    sampler = WeightedRandomSampler(weights=sample_weights, num_samples=train_counters[1]*2, replacement=False)
     train_dataset = DeepFakesDataset(np.asarray(train_dataset), np.asarray(train_labels), IMAGE_SIZE)
-    dl = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True, sampler=None,
-                                 batch_sampler=None, num_workers=0, collate_fn=None,
+    dl = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=False, sampler=sampler,
+                                 batch_sampler=None, num_workers=opt.workers, collate_fn=None,
                                  pin_memory=False, drop_last=False, timeout=0,
                                  worker_init_fn=None, prefetch_factor=2,
                                  persistent_workers=False)
@@ -214,7 +249,7 @@ if __name__ == "__main__":
 
     validation_dataset = DeepFakesDataset(np.asarray(validation_dataset), np.asarray(validation_labels), IMAGE_SIZE, mode='validation')
     val_dataset = torch.utils.data.DataLoader(validation_dataset, batch_size=batch_size, shuffle=True, sampler=None,
-                                    batch_sampler=None, num_workers=0, collate_fn=None,
+                                    batch_sampler=None, num_workers=opt.workers, collate_fn=None,
                                     pin_memory=False, drop_last=False, timeout=0,
                                     worker_init_fn=None, prefetch_factor=2,
                                     persistent_workers=False)
@@ -252,6 +287,7 @@ if __name__ == "__main__":
     not_improved_loss = 0
     previous_loss = math.inf
     for t in range(starting_epoch, opt.num_epochs + 1):
+        save_model = False
         if not_improved_loss == opt.patience:
             break
         counter = 0
@@ -306,8 +342,9 @@ if __name__ == "__main__":
         val_positive = 0
         val_negative = 0
        
-        train_correct /= train_samples
+        train_correct /= counter*batch_size
         total_loss /= counter
+        val_preds = []
         for index, (val_images, val_labels) in enumerate(val_dataset):
     
             val_images = np.transpose(val_images, (0, 3, 1, 2))
@@ -319,7 +356,8 @@ if __name__ == "__main__":
             if opt.model == 0:
                 val_pred = val_pred.logits
 
-            val_pred = val_pred.cpu()
+            val_pred = val_pred.detach().cpu()
+            val_preds.extend([custom_round_single_value(torch.sigmoid(pred).numpy()[0]) for pred in val_pred])
             val_loss = loss_fn(val_pred, val_labels)
             total_val_loss += round(val_loss.item(), 2)
             corrects, positive_class, negative_class = check_correct(val_pred, val_labels)
@@ -339,6 +377,7 @@ if __name__ == "__main__":
             print("Validation loss did not improved")
             not_improved_loss += 1
         else:
+            save_model = True
             not_improved_loss = 0
         
         tb_logger.add_scalar("Training/Accuracy", train_correct, t)
@@ -349,14 +388,16 @@ if __name__ == "__main__":
 
         previous_loss = total_val_loss
         print("#" + str(t) + "/" + str(opt.num_epochs) + " loss:" +
-            str(total_loss) + " accuracy:" + str(train_correct) +" val_loss:" + str(total_val_loss) + " val_accuracy:" + str(val_correct) + " val_0s:" + str(val_negative) + "/" + str(val_counters[0]) + " val_1s:" + str(val_positive) + "/" + str(val_counters[1]))
+            str(total_loss) + " accuracy:" + str(train_correct) +" val_loss:" + str(total_val_loss) + " val_accuracy:" + str(val_correct) + " val_f1_macro:" + str(f1_score(validation_labels, val_preds, average='macro')) + " val_f1_micro:" + str(f1_score(validation_labels, val_preds, average='micro')) + " val_f1_weighted:" + str(f1_score(validation_labels, val_preds, average='weighted')) + " val_0s:" + str(val_negative) + "/" + str(val_counters[0]) + " val_1s:" + str(val_positive) + "/" + str(val_counters[1]))
     
         
         if not os.path.exists(opt.model_path):
             os.makedirs(opt.model_path)
 
         forgery_methods_string = 'm'.join([str(method) for method in opt.forgery_methods])
-        torch.save(model.state_dict(), os.path.join(opt.model_path, opt.model_name + "_" + str(t) + "_" + forgery_methods_string))
+        
+        if save_model and t > 10:
+            torch.save(model.state_dict(), os.path.join(opt.model_path, opt.model_name + "_" + str(t) + "_" + forgery_methods_string))
 
     #training_set = list(dict.fromkeys([os.path.join(opt.data_path, os.path.dirname(row[0].split(" "))) for row in training_set]))
   
